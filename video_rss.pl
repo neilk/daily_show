@@ -52,7 +52,7 @@ tie my @seen_frame, 'Tie::File',
     or die $!;
     
 
-rss_new($recent_uri, 'The Daily Show Videos (Unofficial)', 'Individual frames from ComedyCentral satirical news show');
+rss_new($recent_uri, 'The Daily Show Videos (Unofficial)', 'Clips of the satirical news show from ComedyCentral.com');
 rss_language('en');
 rss_webmaster('neilk@brevity.org');
 rss_daily();
