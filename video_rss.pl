@@ -1,12 +1,12 @@
 #!/usr/local/bin/perl -w
 
-# The Daily Show from comedy central publishes videos on their website.
-# the videos are mixed with ads, and the HTML is often Firefox-hostile.
+# The Daily Show from comedy central publishes frames on their website.
+# the frames are mixed with ads, and the HTML is often Firefox-hostile.
 # this program will periodically look at the Daily show website to:
 
-# - note when new videos are added
+# - note when new frames are added
 # - publish that info in RSS/Atom, as raw mms:// links.
-# - videos or ads may be included in the feed but will 
+# - frames or ads may be included in the feed but will 
 #   appear precisely ONCE. so we must
 #   also keep track of uris seen.
 # - also publish a daily playlist, .m3u format, in a separate feed
@@ -18,13 +18,14 @@ use lib '/home/brevity/lib/perl';
 use LWP::RobotUA;
 use HTML::TreeBuilder;
 use XML::DOM;
+use XML::RSS::SimpleGen; # rss_* functions
 use WWW::RobotRules;
 use URI;
 use Data::Dumper qw/Dumper/;
-use XML::RSS::SimpleGen;
-use NDBM_File;
-use Fcntl; # for O_* constants
+use Tie::File;
+use Tie::Record;
 use File::Basename qw/dirname/;
+use POSIX qw/strftime/;
 
 use Getopt::Long;
 my $DEBUG;
@@ -34,66 +35,122 @@ GetOptions("debug" => \$DEBUG);
 # === config section
 
 my $prog_dir = dirname($0);
+my $prog_run_time = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-my $host = "www.comedycentral.com";
-my $recent_uri = "http://$host/mp/browseresults.jhtml?s=ds";
+my $recent_uri = "http://www.comedycentral.com/mp/browseresults.jhtml?s=ds";
 
-# a list of all the video files we've ever seen.
-tie my %seen_metafile, 'NDBM_File', 
-    "$prog_dir/seen.metafile", O_RDWR|O_CREAT, 0640 or die $!;
+# a list of all the video or flash or whatever files we've ever seen.
+tie my @seen_metafile, 'Tie::Record', 
+    "$prog_dir/seen.metafile.txt",
+    fields => 'time link title description', 
+    or die $!;
 
-# a list of all the video 'frames' we've ever seen, which may
-# contain one or more videos.
-tie my %seen_frame,    'NDBM_File', 
-    "$prog_dir/seen.frame",    O_RDWR|O_CREAT, 0640 or die $!;
+# a list of all the frames we've ever seen, which may
+# contain one or more frames.
+tie my @seen_frame, 'Tie::File', 
+    "$prog_dir/seen.frame.txt",
+    or die $!;
+    
 
-
-rss_new($recent_uri, 'The Daily Show Videos (Unofficial)', 'Individual videos from ComedyCentral satirical news show');
+rss_new($recent_uri, 'The Daily Show Videos (Unofficial)', 'Individual frames from ComedyCentral satirical news show');
 rss_language('en');
 rss_webmaster('neilk@brevity.org');
 rss_daily();
 my $rss_filepath = '/home/brevity/brevity.org/rss/daily_show_video.rss';
 
+my $keep_item_count = 10;
 
 # === end config section
 
 
+# ===== MAIN ===========
 
-# gives us a rudimentary list of the the videos,
-# plus links to frames which contain them
+# what is invisible here is how the subroutines communicate via
+# the global, which is a tied file and thus always recording 
+# to disk
 
-warn "getting links..." if $DEBUG;
-my $videos = get_video_links($recent_uri);
+my ($new_item_count) = get_new_items($recent_uri);
+$new_item_count or exit 0;
 
-# print Dumper $videos;
+update_rss($rss_filepath, $new_item_count);
+# write_playlist($items); # TODO; second rss file, so will have to abandon SimpleGen.
+
+exit 0;
+
+# ======================
 
 
-for my $v (@$videos) {
 
-    warn "looking at $v->{'frame_uri'}" if $DEBUG;
-    # the video is embedded with a metafile link (real or asf)
-    my @metafile_uri = get_metafiles( $v->{'frame_uri'} )
-	or warn "could not find metafiles in $v->{'frame_uri'}"; 
-	
-    for my $uri (@metafile_uri) { 
+
+sub get_new_items {
+
+    warn "getting links..." if $DEBUG;
+    my ($recent_uri) = @_;
+    my @frame = @{ get_frame_links($recent_uri) };
+
+    my $new_item_count;
+    
+    
+    my %seen_metafile = map { $_->{'link'} => 1 } @seen_metafile;
+    
+    for my $f (@frame) {
+    
+        warn "looking at $f->{'frame_uri'}" if $DEBUG;
+        # the frame is embedded with a metafile link (real or asf)
+	# assume asf, all the new ones are asf.
+        my @metafile_uri = get_metafiles( $f->{'frame_uri'} )
+    	or warn "could not find metafiles in $f->{'frame_uri'}"; 
+    	
+        for my $uri (@metafile_uri) { 
+            next if ($seen_metafile{$uri});
+    
+    	    unless (is_ad($uri)) {
+	        # create data structure similar to parsed RSS, so
+		# we can update more easily.
+                push @seen_metafile,
+		     { 'title'        => $f->{'title'},
+		       'description'  => $f->{'desc'},
+		       'link'         => $uri,           
+		       'time'         => $prog_run_time,
+		     };
+	        $new_item_count++;
+	    }
+   
+   
+        }        
         
-	next if ($seen_metafile{$uri});
+	push @seen_frame, $f->{'frame_uri'};
 
-	unless (is_ad($uri)) {
-            rss_item( $uri, $v->{'title'}, $v->{'desc'} );
-	}
+    }
+    
+    return $new_item_count;
 
-        $seen_metafile{$uri} = 1;
-    }        
 }
 
-unless (rss_item_count()) {
-   exit 0;
+
+
+sub update_rss {
+    my ($file, $new_item_count) = @_;
+    
+    # if there are a LOT of new items, show them all.
+    # otherwise show the new items, and as many of the old ones
+    # as needed to make up $keep_item_count
+    
+    my $count = $keep_item_count;
+    if ($new_item_count > $count) {
+        $count = $new_item_count;
+    }
+    
+    if ($count > @seen_metafile) {
+        $count = scalar @seen_metafile;
+    }
+    
+    for my $it (@seen_metafile[ -1*$count .. -1 ]) {
+	rss_item( @{$it}{qw/link title description/} );
+    }
+	
+    rss_save ($file, 7);
 }
-
-rss_save ($rss_filepath, 7);
-
-
 
 
 
@@ -123,7 +180,7 @@ sub get_metafiles {
 
 
 
-sub get_video_links {
+sub get_frame_links {
     
     my ($recent_uri) = @_;
     warn "getting..." if $DEBUG;
@@ -133,14 +190,16 @@ sub get_video_links {
     $all_html_tree->parse($all_html);
     $all_html_tree->eof;
     
-    # html links which will have embedded video
-    # these are our primary id for video
+    # html links which will have embedded frame
+    # these are our primary id for frame
     
     # expected: ... <span class="searchresult">
     #                   <a href="uri"><b>Title</b></a> -- description
     #               </span>
     
-    my @video;
+    my %seen_frame = map { $_ => 1 } @seen_frame;
+    
+    my @frame;
     SR: for my $sr (get_searchresult($all_html_tree)) {
         my ($uri_str, $title, $desc);
         for my $child ($sr->content_list) {
@@ -165,15 +224,14 @@ sub get_video_links {
                                      # dashes at start.
         }      
    
-        # videos are in reverse-chron order, unshift to sort 
-        unshift @video, { 'frame_uri' => $uri_str, 
+        # frames are in reverse-chron order, unshift to sort 
+        unshift @frame, { 'frame_uri' => $uri_str, 
                           'title' => $title, 
                           'desc' => $desc  };
         warn "got frame $uri_str\n" if $DEBUG;
-        $seen_frame{$uri_str} = 1;
     }
     
-    return \@video;
+    return \@frame;
 }
 
  
