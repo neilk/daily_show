@@ -304,6 +304,7 @@ sub get_content {
             goodwrench
             house_ad
 	    .swf
+	    doubleclick.net
         };
         $ad_regex = join '|' => map { quotemeta($_) } @ad_keyword;
         $ad_regex = qr/(?:$ad_regex)/;
