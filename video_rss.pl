@@ -37,7 +37,7 @@ GetOptions("debug" => \$DEBUG);
 my $prog_dir = dirname($0);
 my $prog_run_time = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-my $recent_uri = "http://www.comedycentral.com/mp/browseresults.jhtml?s=ds";
+my $recent_uri = "http://www.comedycentral.com/sitewide/media_player/browseresults.jhtml?showId=934";
 
 # a list of all the video or flash or whatever files we've ever seen.
 tie my @seen_metafile, 'Tie::Record', 
@@ -101,11 +101,14 @@ sub get_new_items {
         my @metafile_uri = get_metafiles( $f->{'frame_uri'} )
     	or warn "could not find metafiles in $f->{'frame_uri'}"; 
     	
+	warn "metafile_uri: @metafile_uri\n" if $DEBUG;
+	
         for my $uri (@metafile_uri) { 
             next if ($seen_metafile{$uri});
     
     	    unless (is_ad($uri)) {
-	        # create data structure similar to parsed RSS, so
+	        warn "new item! $uri\n" if $DEBUG;
+		# create data structure similar to parsed RSS, so
 		# we can update more easily.
                 push @seen_metafile,
 		     { 'title'        => $f->{'title'},
@@ -167,13 +170,21 @@ sub get_metafiles {
     }
     my $embed_uri = $embed->attr('src');
  
-    my $parser = XML::DOM::Parser->new;
-    my $doc = $parser->parse( get_content( $embed_uri ) );
-
     my @uri;
-    for my $node (@{ $doc->getElementsByTagName('ref') }) {
-        push @uri, $node->getAttributeNode('href')->getValue;
-    }
+    
+    eval { 
+    	my $parser = XML::DOM::Parser->new;
+    	my $doc = $parser->parse( get_content( $embed_uri ) );
+
+    	for my $node (@{ $doc->getElementsByTagName('ref') }) {
+            my $href = $node->getAttributeNode('href')->getValue;
+	    # there are 'spacer' insterstitials, usually flash or gifs
+	    if ($href =~ /(wmv|mov|qt|mpg)$/) {
+               push @uri, $href;
+	    }
+        }
+    };
+    warn $@ if $@;
 
     return @uri;
 }
@@ -193,9 +204,12 @@ sub get_frame_links {
     # html links which will have embedded frame
     # these are our primary id for frame
     
-    # expected: ... <span class="searchresult">
-    #                   <a href="uri"><b>Title</b></a> -- description
-    #               </span>
+    # expected: ... <td class="results_desc">
+    #                  <a class="results_title" target="_top" href="uri">
+    #                     Title
+    #                  </a>
+    #                  -- description
+    #               </td>
     
     my %seen_frame = map { $_ => 1 } @seen_frame;
     
@@ -209,9 +223,7 @@ sub get_frame_links {
                     my $uri = URI->new_abs($href,$recent_uri);
                     $uri_str = $uri->as_string;
                     next SR if $seen_frame{$uri_str};
- 
-                    my $bold = $child->look_down('_tag', 'b');
-                    $title = $bold->as_text;
+                    $title = $child->as_text;
                 }
             } else {
                 $desc .= $child;
@@ -240,9 +252,10 @@ sub get_frame_links {
 sub get_searchresult {
     my ($tree) = @_;
     return $tree->look_down(
-        '_tag', 'span',
+        '_tag', 'td',
         sub {
-            return unless $_[0]->attr('class') eq 'searchresult';
+	    my $class = $_[0]->attr('class');
+            return unless defined $class and $class eq 'results_desc';
         }
     );
 }
